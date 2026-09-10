@@ -74,7 +74,133 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         }
     }
 
+    /// Hash two equal-length inputs, allowing implementations to interleave
+    /// the two computations. Must return exactly
+    /// `(Self::hash_or_noop(input_a), Self::hash_or_noop(input_b))`.
+    fn hash_or_noop_pair(input_a: &[F], input_b: &[F]) -> (Self::Hash, Self::Hash) {
+        (Self::hash_or_noop(input_a), Self::hash_or_noop(input_b))
+    }
+
+    /// Hash four equal-length inputs, allowing implementations to interleave
+    /// the four computations. Must return exactly the four individual
+    /// `Self::hash_or_noop` results.
+    fn hash_or_noop_quad(
+        input_a: &[F],
+        input_b: &[F],
+        input_c: &[F],
+        input_d: &[F],
+    ) -> (Self::Hash, Self::Hash, Self::Hash, Self::Hash) {
+        (
+            Self::hash_or_noop(input_a),
+            Self::hash_or_noop(input_b),
+            Self::hash_or_noop(input_c),
+            Self::hash_or_noop(input_d),
+        )
+    }
+
+    /// Two independent `two_to_one` compressions, allowing implementations to
+    /// interleave them. Must return exactly
+    /// `(Self::two_to_one(x0, y0), Self::two_to_one(x1, y1))`.
+    fn two_to_one_pair(
+        x0: Self::Hash,
+        y0: Self::Hash,
+        x1: Self::Hash,
+        y1: Self::Hash,
+    ) -> (Self::Hash, Self::Hash) {
+        (Self::two_to_one(x0, y0), Self::two_to_one(x1, y1))
+    }
+
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash;
+
+    /// Build the native Merkle digests and cap with a specialized backend, when available.
+    ///
+    /// `leaves` is one flat row-major buffer holding `num_leaves` leaves of `leaf_width`
+    /// field elements each. The first result uses
+    /// [`crate::hash::merkle_tree::MerkleTree::digests`] layout.
+    #[allow(clippy::type_complexity)]
+    fn try_build_merkle_tree(
+        _leaves: &[F],
+        _leaf_width: usize,
+        _num_leaves: usize,
+        _cap_height: usize,
+    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+        None
+    }
+
+    /// Like [`Hasher::try_build_merkle_tree`], but the leaves arrive as
+    /// natural-order poly-major columns: tree leaf `i` is
+    /// `columns[j][reverse_bits(i, log2(num_leaves))]`.
+    #[allow(clippy::type_complexity)]
+    fn try_build_merkle_tree_columns(
+        _columns: &[Vec<F>],
+        _cap_height: usize,
+    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+        None
+    }
+
+    /// Allocates retained column-major leaf storage suitable for a specialized
+    /// Merkle backend. The caller may compute the columns directly in this
+    /// storage before passing it to [`Hasher::try_build_merkle_tree_column_store`].
+    #[allow(clippy::type_complexity)]
+    fn try_allocate_merkle_tree_columns(
+        _num_columns: usize,
+        _num_rows: usize,
+        _cap_height: usize,
+    ) -> Option<crate::hash::merkle_tree::ColumnStore<F>> {
+        None
+    }
+
+    /// Like [`Hasher::try_build_merkle_tree_columns`], but accepts retained
+    /// column storage allocated by
+    /// [`Hasher::try_allocate_merkle_tree_columns`].
+    #[allow(clippy::type_complexity)]
+    fn try_build_merkle_tree_column_store(
+        columns: &crate::hash::merkle_tree::ColumnStore<F>,
+        cap_height: usize,
+    ) -> Option<(Vec<Self::Hash>, Vec<Self::Hash>)> {
+        match columns {
+            crate::hash::merkle_tree::ColumnStore::Owned(columns) => {
+                Self::try_build_merkle_tree_columns(columns, cap_height)
+            }
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            crate::hash::merkle_tree::ColumnStore::Shared(_) => None,
+        }
+    }
+
+    /// Computes the coset LDE of the given coefficient columns and the Merkle
+    /// tree over the resulting leaves in one fused backend pass, when a
+    /// specialized backend is available. Returns the retained LDE column
+    /// storage plus digests and cap in
+    /// [`crate::hash::merkle_tree::MerkleTree::digests`] layout.
+    #[allow(clippy::type_complexity)]
+    fn try_build_commitment_from_coeffs(
+        _coeff_columns: &[&[F]],
+        _rate_bits: usize,
+        _cap_height: usize,
+    ) -> Option<(
+        crate::hash::merkle_tree::ColumnStore<F>,
+        Vec<Self::Hash>,
+        Vec<Self::Hash>,
+    )> {
+        None
+    }
+
+    /// Like [`Hasher::try_build_commitment_from_coeffs`], but starting from
+    /// evaluation values: the backend also performs the IFFT and returns the
+    /// coefficient columns.
+    #[allow(clippy::type_complexity)]
+    fn try_build_commitment_from_values(
+        _value_columns: &[&[F]],
+        _rate_bits: usize,
+        _cap_height: usize,
+    ) -> Option<(
+        crate::hash::merkle_tree::ColumnStore<F>,
+        Vec<Self::Hash>,
+        Vec<Self::Hash>,
+        Vec<Vec<F>>,
+    )> {
+        None
+    }
 }
 
 /// Trait for algebraic hash functions, built from a permutation using the sponge construction.

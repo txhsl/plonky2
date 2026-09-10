@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
-use crate::field::extension::{flatten, unflatten, Extendable};
+use crate::field::extension::{unflatten, Extendable, FieldExtension};
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQueryStep};
 use crate::fri::{FriConfig, FriParams};
@@ -17,8 +17,8 @@ use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
-use crate::util::reverse_index_bits_in_place;
 use crate::util::timing::TimingTree;
+use crate::util::{log2_strict, reverse_bits};
 
 /// Builds a FRI proof.
 pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -81,6 +81,47 @@ pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<u
     1 << degree_bits
 }
 
+/// Bit-reversal + flatten in one gather pass: output leaf `i` is the base-field
+/// limb array of `values[reverse_bits(i, log2(values.len()))]`, so the returned
+/// flat buffer is the bit-reversed codeword laid out row-major, ready for
+/// [`MerkleTree::new_flat`].
+///
+/// The gather is bandwidth- and latency-bound rather than arithmetic-bound:
+/// `reverse_bits` scatters consecutive outputs across the whole codeword, so
+/// essentially every read is a cache miss and a single thread can only keep a
+/// handful of them in flight. Splitting the *output* range into blocks lets one
+/// worker per core drive its own independent miss stream. Block `b` owns
+/// outputs `b * FLATTEN_BLOCK .. (b + 1) * FLATTEN_BLOCK`, a partition of
+/// `0..n`, so every slot is written exactly once and the source is only read —
+/// the result is index-for-index identical to the serial fill.
+#[allow(clippy::chunks_exact_to_as_chunks)]
+fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Extension]) -> Vec<F> {
+    const FLATTEN_BLOCK: usize = 1 << 10;
+
+    let n = values.len();
+    let log_n = log2_strict(n);
+    let mut flat: Vec<F> = Vec::with_capacity(n * D);
+    {
+        let spare = &mut flat.spare_capacity_mut()[..n * D];
+        spare
+            .par_chunks_mut(FLATTEN_BLOCK * D)
+            .enumerate()
+            .for_each(|(block, out)| {
+                let base = block * FLATTEN_BLOCK;
+                for (j, slot) in out.chunks_exact_mut(D).enumerate() {
+                    let limbs = values[reverse_bits(base + j, log_n)].to_basefield_array();
+                    for k in 0..D {
+                        slot[k].write(limbs[k]);
+                    }
+                }
+            });
+    }
+    // SAFETY: the loop above wrote every one of the `n * D` slots of spare
+    // capacity exactly once, so the whole prefix is initialized.
+    unsafe { flat.set_len(n * D) };
+    flat
+}
+
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     mut values: PolynomialValues<F::Extension>,
@@ -95,13 +136,17 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     for arity_bits in &fri_params.reduction_arity_bits {
         let arity = 1 << arity_bits;
 
-        reverse_index_bits_in_place(&mut values.values);
-        let chunked_values = values
-            .values
-            .par_chunks(arity)
-            .map(|chunk: &[F::Extension]| flatten(chunk))
-            .collect();
-        let tree = MerkleTree::<F, C::Hasher>::new(chunked_values, fri_params.config.cap_height);
+        // Fused bit-reversal + flatten: one gather pass writes the flat leaf
+        // buffer directly (leaf `i` is the `arity`-chunk of the bit-reversed
+        // codeword starting at `i * arity`), instead of a random-access
+        // in-place permutation followed by a separate flattening pass with a
+        // heap allocation per element.
+        let flat_values = bitrev_flatten::<F, D>(&values.values);
+        let tree = MerkleTree::<F, C::Hasher>::new_flat(
+            flat_values,
+            arity * D,
+            fri_params.config.cap_height,
+        );
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);
@@ -116,7 +161,11 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
                 .collect::<Vec<_>>(),
         );
         shift = shift.exp_u64(arity as u64);
-        values = coeffs.coset_fft(shift.into())
+        // Chunk-wise folding preserves the zero tail: the coefficient vector
+        // keeps `1/2^rate_bits` support every round (asserted by the
+        // truncation below), so the FFT's zero-run shortcut always applies.
+        values =
+            coeffs.coset_fft_with_options(shift.into(), Some(fri_params.config.rate_bits), None)
     }
 
     // When verifying this proof in a circuit with a different number of query steps,
@@ -235,7 +284,7 @@ fn fri_prover_query_round<
     let mut query_steps = Vec::new();
     let initial_proof = initial_merkle_trees
         .iter()
-        .map(|t| (t.get(x_index).to_vec(), t.prove(x_index)))
+        .map(|t| (t.leaf_vec(x_index), t.prove(x_index)))
         .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];
@@ -254,5 +303,42 @@ fn fri_prover_query_round<
             evals_proofs: initial_proof,
         },
         steps: query_steps,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use plonky2_field::types::Sample;
+
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    /// `bitrev_flatten` must be raw-`u64`-identical to the serial
+    /// gather-and-extend loop it replaced, for every leaf and every limb.
+    #[test]
+    fn bitrev_flatten_matches_serial_gather() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FE = <F as Extendable<D>>::Extension;
+
+        // Sizes on both sides of the `FLATTEN_BLOCK = 1 << 10` grain: below it
+        // (a single partial chunk), exactly on it, and several blocks past it.
+        for log_n in [0usize, 1, 5, 10, 11, 13] {
+            let n = 1usize << log_n;
+            let values: Vec<FE> = (0..n).map(|_| FE::rand()).collect();
+
+            // Reference: the original serial fill.
+            let mut expected: Vec<F> = Vec::with_capacity(n * D);
+            for i in 0..n {
+                let x: [F; D] = values[reverse_bits(i, log_n)].to_basefield_array();
+                expected.extend_from_slice(&x);
+            }
+
+            let actual = bitrev_flatten::<F, D>(&values);
+            assert_eq!(actual.len(), expected.len(), "length for n = {n}");
+            for (k, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(a.0, e.0, "limb {k} of {n}");
+            }
+        }
     }
 }

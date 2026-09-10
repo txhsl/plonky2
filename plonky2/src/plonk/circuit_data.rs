@@ -84,6 +84,7 @@ pub struct CircuitConfig {
     /// systematically, but will never exceed this value.
     pub max_quotient_degree_factor: usize,
     pub fri_config: FriConfig,
+    pub optimization_flags: usize,
 }
 
 impl Default for CircuitConfig {
@@ -115,6 +116,7 @@ impl CircuitConfig {
                 reduction_strategy: FriReductionStrategy::ConstantArityBits(4, 5),
                 num_query_rounds: 28,
             },
+            optimization_flags: 0,
         }
     }
 
@@ -138,6 +140,30 @@ impl CircuitConfig {
             ..Self::standard_recursion_config()
         }
     }
+
+    pub fn addition_gate_enabled(&self) -> bool {
+        0 < (self.optimization_flags & (1 << 0))
+    }
+
+    pub fn multiplication_gate_enabled(&self) -> bool {
+        0 < (self.optimization_flags & (1 << 1))
+    }
+
+    pub fn quintic_multiplication_gate_enabled(&self) -> bool {
+        0 < (self.optimization_flags & (1 << 2))
+    }
+
+    pub fn equality_gate_enable(&self) -> bool {
+        0 < (self.optimization_flags & (1 << 3))
+    }
+
+    pub fn quintic_squaring_gate_enabled(&self) -> bool {
+        0 < (self.optimization_flags & (1 << 4))
+    }
+
+    pub fn select_gate_enabled(&self) -> bool {
+        0 < (self.optimization_flags & (1 << 5))
+    }
 }
 
 /// Mock circuit data to only do witness generation without generating a proof.
@@ -151,7 +177,7 @@ pub struct MockCircuitData<F: RichField + Extendable<D>, C: GenericConfig<D, F =
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     MockCircuitData<F, C, D>
 {
-    pub fn generate_witness(&self, inputs: PartialWitness<F>) -> PartitionWitness<F> {
+    pub fn generate_witness(&self, inputs: PartialWitness<F>) -> PartitionWitness<'_, F> {
         generate_partial_witness::<F, C, D>(inputs, &self.prover_only, &self.common).unwrap()
     }
 }
@@ -345,6 +371,16 @@ pub struct ProverOnlyCircuitData<
     /// Generator indices (within the `Vec` above), indexed by the representative of each target
     /// they watch.
     pub generator_indices_by_watches: BTreeMap<usize, Vec<usize>>,
+    /// For each generator (indexed as in `generators`), the number of *distinct* representatives
+    /// it watches — equivalently, the number of entries of `generator_indices_by_watches` whose
+    /// watcher list contains that generator.
+    ///
+    /// Derived once inside the builder's `generator_indices_by_watches` construction pass so that
+    /// witness generation can seed its `unresolved_watches` counters by cloning this vector and
+    /// decrementing on first population, instead of traversing the entire watcher map at the
+    /// start of every proof. Runtime-only: it is a pure function of `generator_indices_by_watches`
+    /// and is reconstructed on deserialization, so the serialized format is unchanged.
+    pub generator_watch_counts: Vec<usize>,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
@@ -355,7 +391,11 @@ pub struct ProverOnlyCircuitData<
     pub public_inputs: Vec<Target>,
     /// A map from each `Target`'s index to the index of its representative in the disjoint-set
     /// forest.
-    pub representative_map: Vec<usize>,
+    ///
+    /// Stored as `u32` (see [`crate::plonk::permutation_argument::Forest`]); values are
+    /// zero-extended at every indexing site. The serialized encoding keeps the legacy 8-byte
+    /// per-entry format.
+    pub representative_map: Vec<u32>,
     /// Pre-computed roots for faster FFT.
     pub fft_root_table: Option<FftRootTable<F>>,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
